@@ -1,162 +1,249 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <termios.h>
-#include <fcntl.h>
+#include <sys/select.h>
 #include <time.h>
+#include <string.h>
 
-#define BOARD_H 20
-#define BOARD_W 20
+// Define the dimensions of the game board
+#define BOARD_HEIGHT 25
+#define BOARD_WIDTH 25
+#define MAX_OBSTACLES 5
 
-/* Snake State */
-int headX, headY;
-int fruitX, fruitY;
-int score = 0;
-int snakeLen = 0;
-int tailX[200], tailY[200];
-int gameOver = 0;
-int direction = 0;
+// Struct for positions
+typedef struct {
+    int x, y;
+} Position;
 
-/* ---------- Non-blocking Input (Linux) ---------- */
-int keyAvailable() {
-    struct termios oldt, newt;
-    int ch, oldf;
+// Struct for snake segments (linked list)
+typedef struct SnakeSegment {
+    Position pos;
+    struct SnakeSegment* next;
+} SnakeSegment;
 
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
+// Struct for game state
+typedef struct {
+    SnakeSegment* head;
+    Position fruit;
+    int fruitType;  // 0: normal (10 points), 1: special (20 points)
+    Position obstacles[MAX_OBSTACLES];
+    int obstacleCount;
+    int score;
+    int direction;  // 1: up, 2: down, 3: left, 4: right
+    int gameOver;
+    int speed;  // microseconds for delay
+} GameState;
 
-    newt.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+// Global buffer for rendering
+char boardBuffer[BOARD_HEIGHT + 1][BOARD_WIDTH + 1];
 
-    oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
-
-    ch = getchar();
-
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    fcntl(STDIN_FILENO, F_SETFL, oldf);
-
-    if (ch != EOF) {
-        ungetc(ch, stdin);
-        return 1;
-    }
-    return 0;
-}
-
-char readKey() {
-    char c;
-    read(STDIN_FILENO, &c, 1);
-    return c;
-}
-
-/* ---------- Initialization ---------- */
-void initGame() {
+// Function to initialize the game state
+void initializeGame(GameState* state) {
     srand(time(NULL));
 
-    headX = BOARD_H / 2;
-    headY = BOARD_W / 2;
+    // Initialize snake head
+    state->head = (SnakeSegment*)malloc(sizeof(SnakeSegment));
+    state->head->pos.x = BOARD_HEIGHT / 2;
+    state->head->pos.y = BOARD_WIDTH / 2;
+    state->head->next = NULL;
 
-    fruitX = (rand() % (BOARD_H - 2)) + 1;
-    fruitY = (rand() % (BOARD_W - 2)) + 1;
+    // Place fruit randomly
+    state->fruit.x = (rand() % (BOARD_HEIGHT - 2)) + 1;
+    state->fruit.y = (rand() % (BOARD_WIDTH - 2)) + 1;
+    state->fruitType = rand() % 2;  // Random fruit type
 
-    score = 0;
-    snakeLen = 0;
-    gameOver = 0;
-    direction = 0;
+    // Add obstacles
+    state->obstacleCount = MAX_OBSTACLES;
+    for (int i = 0; i < MAX_OBSTACLES; i++) {
+        state->obstacles[i].x = (rand() % (BOARD_HEIGHT - 2)) + 1;
+        state->obstacles[i].y = (rand() % (BOARD_WIDTH - 2)) + 1;
+    }
+
+    // Reset other state
+    state->score = 0;
+    state->direction = 0;
+    state->gameOver = 0;
+    state->speed = 150000;  // Initial speed
 }
 
-/* ---------- Draw Game ---------- */
-void draw() {
+// Function to check for non-blocking input using select()
+int checkForInput() {
+    fd_set readfds;
+    struct timeval tv;
+    FD_ZERO(&readfds);
+    FD_SET(STDIN_FILENO, &readfds);
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    return select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv) > 0;
+}
+
+// Function to read a single key press
+char getInputKey() {
+    char inputChar;
+    read(STDIN_FILENO, &inputChar, 1);
+    return inputChar;
+}
+
+// Function to handle user input
+void processUserInput(GameState* state) {
+    if (checkForInput()) {
+        char key = getInputKey();
+        if (key == 'w' && state->direction != 2) state->direction = 1;  // Up, not down
+        else if (key == 's' && state->direction != 1) state->direction = 2;  // Down, not up
+        else if (key == 'a' && state->direction != 4) state->direction = 3;  // Left, not right
+        else if (key == 'd' && state->direction != 3) state->direction = 4;  // Right, not left
+    }
+}
+
+// Function to update the board buffer
+void updateBoardBuffer(GameState* state) {
+    // Clear buffer
+    memset(boardBuffer, ' ', sizeof(boardBuffer));
+
+    // Draw borders
+    for (int i = 0; i <= BOARD_WIDTH; i++) {
+        boardBuffer[0][i] = '*';
+        boardBuffer[BOARD_HEIGHT][i] = '*';
+    }
+    for (int i = 0; i <= BOARD_HEIGHT; i++) {
+        boardBuffer[i][0] = '*';
+        boardBuffer[i][BOARD_WIDTH] = '*';
+    }
+
+    // Draw obstacles
+    for (int i = 0; i < state->obstacleCount; i++) {
+        boardBuffer[state->obstacles[i].x][state->obstacles[i].y] = '#';
+    }
+
+    // Draw snake
+    SnakeSegment* current = state->head;
+    while (current != NULL) {
+        boardBuffer[current->pos.x][current->pos.y] = (current == state->head) ? 'O' : 'o';
+        current = current->next;
+    }
+
+    // Draw fruit
+    boardBuffer[state->fruit.x][state->fruit.y] = (state->fruitType == 0) ? '@' : '$';
+}
+
+// Function to render the board from buffer
+void renderBoard(GameState* state) {
+    updateBoardBuffer(state);
+
+    // Clear screen and print buffer
     system("clear");
-
-    for (int r = 0; r <= BOARD_H; r++) {
-        for (int c = 0; c <= BOARD_W; c++) {
-
-            if (r == 0 || r == BOARD_H || c == 0 || c == BOARD_W) {
-                printf("*");
-            }
-            else if (r == headX && c == headY) {
-                printf("O");
-            }
-            else if (r == fruitX && c == fruitY) {
-                printf("@");
-            }
-            else {
-                int printed = 0;
-                for (int t = 0; t < snakeLen; t++) {
-                    if (tailX[t] == r && tailY[t] == c) {
-                        printf("o");
-                        printed = 1;
-                        break;
-                    }
-                }
-                if (!printed)
-                    printf(" ");
-            }
+    for (int r = 0; r <= BOARD_HEIGHT; r++) {
+        for (int c = 0; c <= BOARD_WIDTH; c++) {
+            putchar(boardBuffer[r][c]);
         }
-        printf("\n");
+        putchar('\n');
     }
 
-    printf("\nScore: %d\n", score);
+    // Display score and fruit type
+    printf("\nScore: %d | Fruit: %s (%d points)\n", state->score, 
+           (state->fruitType == 0) ? "Normal" : "Special", 
+           (state->fruitType == 0) ? 10 : 20);
 }
 
-/* ---------- Update Movement ---------- */
-void updateLogic() {
-    int prevX = tailX[0], prevY = tailY[0];
-    int tempX, tempY;
-    tailX[0] = headX;
-    tailY[0] = headY;
+// Function to update game logic
+void updateGameLogic(GameState* state) {
+    if (state->direction == 0) return;  // No movement if no direction set
 
-    for (int i = 1; i < snakeLen; i++) {
-        tempX = tailX[i];
-        tempY = tailY[i];
-        tailX[i] = prevX;
-        tailY[i] = prevY;
-        prevX = tempX;
-        prevY = tempY;
+    // Calculate new head position
+    Position newHeadPos = state->head->pos;
+    switch (state->direction) {
+        case 1: newHeadPos.x--; break;  // Up
+        case 2: newHeadPos.x++; break;  // Down
+        case 3: newHeadPos.y--; break;  // Left
+        case 4: newHeadPos.y++; break;  // Right
     }
 
-    switch (direction) {
-        case 1: headX--; break;   // UP
-        case 2: headX++; break;   // DOWN
-        case 3: headY--; break;   // LEFT
-        case 4: headY++; break;   // RIGHT
+    // Check wall collision
+    if (newHeadPos.x <= 0 || newHeadPos.x >= BOARD_HEIGHT || 
+        newHeadPos.y <= 0 || newHeadPos.y >= BOARD_WIDTH) {
+        state->gameOver = 1;
+        return;
     }
 
-    if (headX <= 0 || headX >= BOARD_H || headY <= 0 || headY >= BOARD_W)
-        gameOver = 1;
+    // Check obstacle collision
+    for (int i = 0; i < state->obstacleCount; i++) {
+        if (newHeadPos.x == state->obstacles[i].x && newHeadPos.y == state->obstacles[i].y) {
+            state->gameOver = 1;
+            return;
+        }
+    }
 
-    if (headX == fruitX && headY == fruitY) {
-        fruitX = (rand() % (BOARD_H - 2)) + 1;
-        fruitY = (rand() % (BOARD_W - 2)) + 1;
-        score += 10;
-        snakeLen++;
+    // Check self collision
+    SnakeSegment* current = state->head;
+    while (current != NULL) {
+        if (newHeadPos.x == current->pos.x && newHeadPos.y == current->pos.y) {
+            state->gameOver = 1;
+            return;
+        }
+        current = current->next;
+    }
+
+    // Create new head segment
+    SnakeSegment* newHead = (SnakeSegment*)malloc(sizeof(SnakeSegment));
+    newHead->pos = newHeadPos;
+    newHead->next = state->head;
+    state->head = newHead;
+
+    // Check if fruit eaten
+    if (newHeadPos.x == state->fruit.x && newHeadPos.y == state->fruit.y) {
+        // Add points based on fruit type
+        state->score += (state->fruitType == 0) ? 10 : 20;
+
+        // Reposition fruit
+        do {
+            state->fruit.x = (rand() % (BOARD_HEIGHT - 2)) + 1;
+            state->fruit.y = (rand() % (BOARD_WIDTH - 2)) + 1;
+        } while (boardBuffer[state->fruit.x][state->fruit.y] != ' ');  // Ensure not on obstacle/snake
+
+        state->fruitType = rand() % 2;
+
+        // Increase speed every 50 points
+        if (state->score % 50 == 0 && state->speed > 50000) {
+            state->speed -= 10000;
+        }
+    } else {
+        // Remove tail if no fruit eaten
+        SnakeSegment* tail = state->head;
+        while (tail->next != NULL && tail->next->next != NULL) {
+            tail = tail->next;
+        }
+        if (tail->next != NULL) {
+            free(tail->next);
+            tail->next = NULL;
+        }
     }
 }
 
-/* ---------- Read Input ---------- */
-void handleInput() {
-    if (keyAvailable()) {
-        char key = readKey();
-
-        if (key == 'w') direction = 1;
-        else if (key == 's') direction = 2;
-        else if (key == 'a') direction = 3;
-        else if (key == 'd') direction = 4;
+// Function to free snake memory
+void freeSnake(SnakeSegment* head) {
+    SnakeSegment* current = head;
+    while (current != NULL) {
+        SnakeSegment* next = current->next;
+        free(current);
+        current = next;
     }
 }
 
-/* ---------- Main ---------- */
+// Main game loop
 int main() {
-    initGame();
+    GameState gameState;
+    initializeGame(&gameState);
 
-    while (!gameOver) {
-        handleInput();
-        draw();
-        updateLogic();
-        usleep(120000);
+    while (!gameState.gameOver) {
+        processUserInput(&gameState);
+        renderBoard(&gameState);
+        updateGameLogic(&gameState);
+        usleep(gameState.speed);
     }
 
-    printf("\nGame Over! Final Score: %d\n", score);
+    // Clean up
+    freeSnake(gameState.head);
+
+    printf("\nGame Over! Final Score: %d\n", gameState.score);
     return 0;
 }
